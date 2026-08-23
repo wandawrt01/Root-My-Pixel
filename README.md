@@ -14,12 +14,12 @@ Root My Pixel lets you *temporarily* gain root access with ReSukiSU in just one 
    - At startup, the app uses native JNI (`NativeProbe`), `/proc/version` queries, and system properties to detect the device codename, kernel version, CPU ABI, memory page size, and build display ID.
    - Via `ResolveTargetUseCase`, it matches the device details against supported target profiles defined in `assets/profiles.json`.
 
-2. **Shizuku Integration**
-   - The app uses **Shizuku** (UID 2000) to acquire ADB shell privileges without needing initial root access, which is required to stage and execute payload binaries in `/data/local/tmp`.
-   - A managed `ExploitService` is bound via Binder IPC to stream exploit execution logs to the UI in real time.
+2. **Execution Mode** (toggle on the main screen, default off)
+   - **App domain** (default): the helper is executed straight out of `nativeLibraryDir` (an app uid may exec there, but not in shell-owned `/data/local/tmp`) and dlopens the payload from `filesDir`. Nothing in the chain needs shell: the root child is forked from the payload process *before* its credentials are patched, so it captures the app uid, and the su daemon authorises that uid alongside `RMG_APP_UID`. Everything after the cred patch runs as root with SELinux permissive.
+   - **Shizuku**: with the toggle on, the app uses **Shizuku** (UID 2000) to acquire ADB shell privileges, stages the payload and helper in `/data/local/tmp`, and binds a managed `ExploitService` via Binder IPC to stream logs to the UI.
 
 3. **Exploit Payload Extraction & Execution**
-   - Precompiled binary payloads (`.so`) corresponding to each supported build and the native helper tool (`libcve43499root.so`) are extracted from APK assets to `/data/local/tmp`.
+   - Precompiled binary payloads (`.so`) corresponding to each supported build and the native helper tool (`libcve43499root.so`) are extracted from APK assets — to `/data/local/tmp` in Shizuku mode, or to the app's own `filesDir` in app-uid mode.
    - The IonStack exploit (CVE-2026-43499) is executed to establish a local root daemon socket (`temp_su.sock`), acquiring full `root` privileges.
 
 4. **KernelSU / ReSukiSU Integration**
@@ -61,8 +61,8 @@ Root My Pixel lets you *temporarily* gain root access with ReSukiSU in just one 
 ## Prerequisites
 
 1. A supported Google Pixel device listed in the table above.
-2. **Shizuku** installed and running via ADB (`adb shell sh /sdcard/Android/data/rikka.shizuku/starter.sh` or Wireless Debugging).
-3. **ReSukiSU Manager** installed on the device to manage root permissions granted to apps.
+2. **ReSukiSU Manager** installed on the device to manage root permissions granted to apps.
+3. *Optional:* **Shizuku** installed and running via ADB (`adb shell sh /sdcard/Android/data/rikka.shizuku/starter.sh` or Wireless Debugging), if you enable the Shizuku toggle. Shizuku is the more heavily tested path; in the default app-domain mode keep the app in the foreground for the whole run, since the payload is a child of the app process and is subject to app lifecycle.
 
 ---
 

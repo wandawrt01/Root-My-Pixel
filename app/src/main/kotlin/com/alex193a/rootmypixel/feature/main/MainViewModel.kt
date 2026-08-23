@@ -13,6 +13,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.alex193a.rootmypixel.R
 import com.alex193a.rootmypixel.core.Result
+import com.alex193a.rootmypixel.data.AppPreferences
 import com.alex193a.rootmypixel.domain.model.DeviceSnapshot
 import com.alex193a.rootmypixel.domain.model.InstallPhase
 import com.alex193a.rootmypixel.domain.model.InstallUiState
@@ -40,12 +41,14 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val mutableShizukuAvailable = MutableStateFlow(false)
     private val mutableReSukiSuInstalled = MutableStateFlow(false)
     private val mutableUptimeExceeded = MutableStateFlow(false)
+    private val mutableShizukuMode = MutableStateFlow(AppPreferences.shizukuMode(application))
     private var refreshJob: Job? = null
 
     val state: StateFlow<InstallUiState> = mutableState.asStateFlow()
     val shizukuAvailable: StateFlow<Boolean> = mutableShizukuAvailable.asStateFlow()
     val reSukiSuInstalled: StateFlow<Boolean> = mutableReSukiSuInstalled.asStateFlow()
     val uptimeExceeded: StateFlow<Boolean> = mutableUptimeExceeded.asStateFlow()
+    val shizukuMode: StateFlow<Boolean> = mutableShizukuMode.asStateFlow()
 
 
     private val shizukuPermissionHandler = Handler(Looper.getMainLooper())
@@ -168,6 +171,11 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
         }
+    }
+
+    fun setShizukuMode(enabled: Boolean) {
+        AppPreferences.setShizukuMode(app, enabled)
+        mutableShizukuMode.value = enabled
     }
 
     fun install() {

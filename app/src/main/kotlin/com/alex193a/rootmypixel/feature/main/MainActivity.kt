@@ -43,6 +43,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
@@ -79,6 +80,7 @@ class MainActivity : ComponentActivity() {
             val shizukuAvailable by installViewModel.shizukuAvailable.collectAsStateWithLifecycle()
             val reSukiSuInstalled by installViewModel.reSukiSuInstalled.collectAsStateWithLifecycle()
             val uptimeExceeded by installViewModel.uptimeExceeded.collectAsStateWithLifecycle()
+            val shizukuMode by installViewModel.shizukuMode.collectAsStateWithLifecycle()
 
             RootMyPixelTheme {
                 MainScreen(
@@ -86,6 +88,8 @@ class MainActivity : ComponentActivity() {
                     shizukuAvailable = shizukuAvailable,
                     reSukiSuInstalled = reSukiSuInstalled,
                     uptimeExceeded = uptimeExceeded,
+                    shizukuMode = shizukuMode,
+                    onShizukuModeChange = { installViewModel.setShizukuMode(it) },
                     onRefresh = { installViewModel.refresh() },
                     onInstall = { installViewModel.install() },
                     onExportLog = { installViewModel.exportLog() },
@@ -107,6 +111,8 @@ private fun MainScreen(
     shizukuAvailable: Boolean,
     reSukiSuInstalled: Boolean,
     uptimeExceeded: Boolean,
+    shizukuMode: Boolean,
+    onShizukuModeChange: (Boolean) -> Unit,
     onRefresh: () -> Unit,
     onInstall: () -> Unit,
     onExportLog: () -> Unit,
@@ -181,8 +187,13 @@ private fun MainScreen(
                 Spacer(modifier = Modifier.height(8.dp))
             }
 
-            // Shizuku status
-            ShizukuStatusCard(available = shizukuAvailable)
+            // Shizuku mode toggle, and its status when enabled
+            ShizukuModeCard(enabled = shizukuMode, onEnabledChange = onShizukuModeChange)
+
+            if (shizukuMode) {
+                Spacer(modifier = Modifier.height(8.dp))
+                ShizukuStatusCard(available = shizukuAvailable)
+            }
 
             Spacer(modifier = Modifier.height(8.dp))
 
@@ -331,6 +342,34 @@ private fun UptimeErrorCard(exceeded: Boolean) {
 }
 
 @Composable
+private fun ShizukuModeCard(enabled: Boolean, onEnabledChange: (Boolean) -> Unit) {
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onEnabledChange(!enabled) },
+        shape = MaterialTheme.shapes.medium,
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+        ),
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                text = stringResource(R.string.shizuku_mode),
+                style = MaterialTheme.typography.bodyMedium,
+                fontSize = 12.sp,
+                modifier = Modifier.weight(1f),
+            )
+            Switch(checked = enabled, onCheckedChange = null)
+        }
+    }
+}
+
+@Composable
 private fun ShizukuStatusCard(available: Boolean) {
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -339,7 +378,7 @@ private fun ShizukuStatusCard(available: Boolean) {
             containerColor = if (available)
                 MaterialTheme.colorScheme.primaryContainer
             else
-                MaterialTheme.colorScheme.surfaceContainerHighest,
+                MaterialTheme.colorScheme.errorContainer,
         ),
     ) {
         Row(

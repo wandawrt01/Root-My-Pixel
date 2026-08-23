@@ -9,7 +9,8 @@
     <string name="status_support_failed">Device not supported</string>
     <string name="status_ksu_active">ReSukiSU is active</string>
     <string name="shikuzu_shell_active">Shizuku connected and active</string>
-    <string name="shikuzu_shell_not_active">Shizuku not connected — exploit will fail</string>
+    <string name="shikuzu_shell_not_active">Shizuku not connected</string>
+    <string name="shizuku_mode">Run payload via Shizuku</string>
     <string name="developed_by">DEVELOPED BY</string>
     <string name="missing_manager_title">ReSukiSU Manager not installed</string>
     <string name="missing_manager_description">You need the ReSukiSU Manager app to manage root permissions</string>
@@ -60,6 +61,10 @@
     <string name="log_profile">Matched profile: %1$s</string>
     <string name="log_download_verified">Payloads extracted successfully</string>
     <string name="log_bootstrap_root">Root bootstrap completed</string>
+    <string name="log_exec_mode_shizuku">Running payload via Shizuku (uid 2000)</string>
+    <string name="log_exec_mode_app">Running payload in app domain</string>
+    <string name="log_kaslr_cached">KASLR base %1$s cached for this boot</string>
+    <string name="log_kaslr_reused">Reusing KASLR base %1$s — skipping slide</string>
     <string name="log_ksu_staged">ReSukiSU binary staged</string>
     <string name="log_ksu_control_verified">ReSukiSU control interface verified</string>
     <string name="log_install_complete">Installation complete — ReSukiSU is active</string>

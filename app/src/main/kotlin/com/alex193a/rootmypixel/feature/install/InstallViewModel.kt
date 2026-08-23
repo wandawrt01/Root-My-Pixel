@@ -5,11 +5,13 @@ import android.content.ComponentName
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.os.IBinder
+import android.os.Process
 import android.os.SystemClock
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.alex193a.rootmypixel.R
 import com.alex193a.rootmypixel.core.Result
+import com.alex193a.rootmypixel.data.AppPreferences
 import com.alex193a.rootmypixel.domain.model.DeviceSnapshot
 import com.alex193a.rootmypixel.domain.model.InstallPhase
 import com.alex193a.rootmypixel.domain.model.InstallUiState
@@ -171,14 +173,21 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
                 }
                 appendLog("Payloads extracted from APK")
 
-                val useShizuku = hasShizukuPermission()
-                require(useShizuku) {
-                    app.getString(R.string.error_shizuku_required)
+                val useShizuku = AppPreferences.shizukuMode(app)
+                if (useShizuku) {
+                    require(hasShizukuPermission()) {
+                        app.getString(R.string.error_shizuku_required)
+                    }
                 }
-                appendLog("[*] Using Shizuku shell access: $useShizuku")
+                appendLog(
+                    app.getString(
+                        if (useShizuku) R.string.log_exec_mode_shizuku
+                        else R.string.log_exec_mode_app
+                    )
+                )
 
                 setPhase(InstallPhase.Exploiting, app.getString(R.string.status_exploit))
-                executeExploit(payloads)
+                executeExploit(payloads, useShizuku)
 
                 if (permissiveOnly) {
                     setPhase(InstallPhase.Installed, "SELinux permissive + root shell ready")
@@ -257,13 +266,143 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
 
     // --- Exploit execution ---
 
-    private suspend fun executeExploit(payloads: VerifiedPayloads) {
-        executeExploitViaShizuku(payloads)
+    private suspend fun executeExploit(payloads: VerifiedPayloads, useShizuku: Boolean) {
+        if (useShizuku) executeExploitViaShizuku(payloads) else executeExploitInApp(payloads)
         appendLog(app.getString(R.string.log_bootstrap_root))
     }
 
+    /**
+     * Environment shared by both launch paths.
+     *
+     * Both entries are boot-scoped facts the payload cannot safely rediscover on
+     * a retry, because a failed attempt leaves the kernel's boot_id sysctl
+     * pointing at kernel memory until reboot:
+     *  - RMG_ASHMEM_PATH: the real /dev/ashmem<boot_id> node. Without it a retry
+     *    derives a bogus name and dies much later on the unopenable default.
+     *  - KASLR_BASE: a base already observed this boot, which lets the payload
+     *    skip the slide. The slide is the only stage that panics the device when
+     *    it loses its race, so a retry should never run it twice.
+     */
+    private fun payloadEnv(): Map<String, String> = buildMap {
+        AppPreferences.ashmemPath(app)?.let { put("RMG_ASHMEM_PATH", it) }
+        AppPreferences.kaslrBase(app)?.let {
+            put("KASLR_BASE", it)
+            appendLog(app.getString(R.string.log_kaslr_reused, it))
+        }
+    }
+
+    /**
+     * Remember a base the payload just derived, so the next attempt this boot can
+     * skip the slide. Logged as "slide-kaslr-ok pid=… base=<hex> slide=…", and
+     * the payload parses KASLR_BASE with strtoull(…, 0), so it needs the 0x form.
+     */
+    private fun harvestKaslrBase(rawLog: String) {
+        if (AppPreferences.kaslrBase(app) != null) return
+        val base = KASLR_BASE_PATTERN.find(rawLog)?.groupValues?.getOrNull(1) ?: return
+        AppPreferences.setKaslrBase(app, "0x$base")
+        appendLog(app.getString(R.string.log_kaslr_cached, base))
+    }
+
+    /**
+     * Runs the payload in the app's own domain, without Shizuku.
+     *
+     * The helper is executed straight out of nativeLibraryDir — an app uid may exec there,
+     * but not in /data/local/tmp, which is shell-owned — and it dlopens the payload extracted
+     * to filesDir. Nothing in the 6.1 chain needs shell: the root child is forked from this
+     * process before its creds are patched (root.c spawn_root_child), so it captures this uid
+     * and the su daemon authorises it alongside RMG_APP_UID (su_daemon.c is_allowed_uid).
+     * Everything after the cred patch runs as root with SELinux permissive, which is why the
+     * daemon can still place its socket under /data/local/tmp.
+     */
+    private suspend fun executeExploitInApp(payloads: VerifiedPayloads) {
+        val helper = File(app.applicationInfo.nativeLibraryDir, HELPER_LIB_NAME)
+        require(helper.exists() && helper.canExecute()) {
+            app.getString(R.string.error_helper_unavailable)
+        }
+
+        val logFile = File(app.filesDir, EXPLOIT_LOG_NAME)
+        logFile.delete()
+
+        val uid = Process.myUid().toString()
+        val process = ProcessBuilder(
+            helper.absolutePath,
+            "--run-payload",
+            payloads.exploit.absolutePath,
+            helper.absolutePath,
+            logFile.absolutePath,
+        )
+            .redirectErrorStream(true)
+            .apply {
+                environment()["RMG_CLIENT_UID"] = uid
+                environment()["RMG_APP_UID"] = uid
+                environment().putAll(payloadEnv())
+            }
+            .start()
+
+        try {
+            val logPrefix = mutableState.value.log
+            val startedAt = SystemClock.elapsedRealtime()
+            var lastProgressAt = startedAt
+            var lastRawLog = ""
+
+            while (process.isAlive) {
+                val currentLog = logFile.readTextOrEmpty()
+                if (currentLog != lastRawLog) {
+                    publishLog(logPrefix, currentLog)
+                    // Harvested mid-run: an attempt that derives a base and then
+                    // dies has still paid the slide's cost, and the next one
+                    // should not pay it again.
+                    harvestKaslrBase(currentLog)
+                    lastRawLog = currentLog
+                    lastProgressAt = SystemClock.elapsedRealtime()
+                }
+                val now = SystemClock.elapsedRealtime()
+                require(now - lastProgressAt < EXPLOIT_STALL_MILLIS) {
+                    app.getString(R.string.error_exploit_stalled)
+                }
+                require(now - startedAt < EXPLOIT_TOTAL_MILLIS) {
+                    app.getString(R.string.error_exploit_timeout)
+                }
+                delay(LOG_POLL_INTERVAL)
+            }
+
+            val exitCode = process.waitFor()
+            // The payload writes to the log file; the runner itself only reports loader errors
+            // (a failed dlopen of the payload lands here, not in the log).
+            val runnerOutput = process.inputStream.bufferedReader().use { it.readText() }.trim()
+            val finalLog = logFile.readTextOrEmpty()
+            if (finalLog.isNotBlank()) {
+                publishLog(logPrefix, finalLog)
+            }
+            if (runnerOutput.isNotBlank()) {
+                appendLog(runnerOutput.take(2000))
+            }
+
+            require(exitCode == 0) {
+                app.getString(
+                    R.string.error_payload_exit,
+                    exitCode,
+                    runnerOutput.takeIf(String::isNotBlank)?.let { " ($it)" } ?: "",
+                )
+            }
+            require(finalLog.contains("done=1") && finalLog.contains("root=1")) {
+                app.getString(R.string.error_success_marker)
+            }
+        } finally {
+            if (process.isAlive) process.destroy()
+        }
+    }
+
+    private fun File.readTextOrEmpty(): String =
+        runCatching { if (exists()) readText() else "" }.getOrDefault("")
+
+    /** Mirror the payload log into filesDir so the export action can reach it in both modes. */
+    private fun persistLog(contents: String) {
+        runCatching { File(app.filesDir, EXPLOIT_LOG_NAME).writeText(contents) }
+    }
+
     private suspend fun executeExploitViaShizuku(payloads: VerifiedPayloads) {
-        val helper = File(app.applicationInfo.nativeLibraryDir, "libcve43499root.so")
+        val helper = File(app.applicationInfo.nativeLibraryDir, HELPER_LIB_NAME)
         require(helper.exists()) { app.getString(R.string.error_helper_unavailable) }
 
         val handle = bindExploitService()
@@ -275,6 +414,7 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
                 payloads.exploit.readBytes(),
                 helper.readBytes(),
                 "/data/local/tmp/exploit.log",
+                payloadEnv().map { (name, value) -> "$name=$value" }.toTypedArray(),
             )
 
             val startedAt = SystemClock.elapsedRealtime()
@@ -288,6 +428,7 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
 
                 if (currentLog != lastRawLog) {
                     publishLog(logPrefix, currentLog)
+                    harvestKaslrBase(currentLog)
                     lastRawLog = currentLog
                     lastProgressAt = SystemClock.elapsedRealtime()
                 }
@@ -305,6 +446,7 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
             val finalLog = handle.service.exec("cat /data/local/tmp/exploit.log 2>/dev/null || true")
             if (finalLog.isNotBlank()) {
                 publishLog(logPrefix, finalLog)
+                persistLog(finalLog)
             }
 
             require(exitCode == 0) {
@@ -336,7 +478,7 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
     private fun installKernelSu(payloads: VerifiedPayloads) {
         val ksudSource = payloads.kernelSu.absolutePath
         val ksudDest = "/data/local/tmp/ksud-pixel"
-        val helper = File(app.applicationInfo.nativeLibraryDir, "libcve43499root.so")
+        val helper = File(app.applicationInfo.nativeLibraryDir, HELPER_LIB_NAME)
 
         // 1. Wait for daemon to be ready
         awaitDaemonSocket()
@@ -428,7 +570,7 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
 
     private fun diagnoseDaemon() {
         try {
-            val helper = File(app.applicationInfo.nativeLibraryDir, "libcve43499root.so")
+            val helper = File(app.applicationInfo.nativeLibraryDir, HELPER_LIB_NAME)
             if (!helper.exists()) {
                 appendLog("[diag] helper binary missing")
                 return
@@ -450,7 +592,7 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
 
     fun softReboot() {
         viewModelScope.launch(Dispatchers.IO) {
-            val helper = File(app.applicationInfo.nativeLibraryDir, "libcve43499root.so")
+            val helper = File(app.applicationInfo.nativeLibraryDir, HELPER_LIB_NAME)
             if (!helper.exists()) return@launch
             val result = runHelper(helper, "-c",
                 "killall -9 system_server 2>/dev/null; true")
@@ -487,6 +629,9 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
     data class CommandResult(val code: Int, val output: String)
 
     companion object {
+        private const val HELPER_LIB_NAME = "libcve43499root.so"
+        private const val EXPLOIT_LOG_NAME = "exploit.log"
+        private val KASLR_BASE_PATTERN = Regex("slide-kaslr-ok[^\\n]*\\bbase=([0-9a-f]{16})\\b")
         private const val EXPLOIT_STALL_MILLIS = 600_000L
         private const val EXPLOIT_TOTAL_MILLIS = 1_800_000L
         private const val MAX_LOG_CHARS = 5 * 1024 * 1024
