@@ -203,6 +203,14 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
                 if (error is CancellationException) throw error
                 appendLog("[-] ${error.message ?: error.javaClass.simpleName}")
                 setPhase(InstallPhase.Failed, app.getString(R.string.status_install_failed))
+            } finally {
+                // The payload writes its own log, but everything the install does
+                // around it — which step reached what, and what the daemon said —
+                // lived only in the UI until now, so a failed run could only be
+                // read off the screen.
+                runCatching {
+                    File(app.filesDir, INSTALL_LOG_NAME).writeText(mutableState.value.log)
+                }
             }
         }
     }
@@ -507,35 +515,85 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
             app.getString(R.string.error_ksu_stage, "stage failed after 5 attempts")
         }
 
-        // 3. Execute late-load via daemon root
+        // 3. Install a late-load.d hook, then trigger late-load.
+        //
+        // Everything that has to happen after the module loads runs from ksud's
+        // own stage-script hook rather than from here, because nothing on this
+        // side survives that point: ksud restores SELinux to enforcing during
+        // module init, the app uid then cannot reach the daemon socket, and a
+        // root shell spawned by the daemon inherits the patched u:r:kernel:s0
+        // context, which may not exec anything once enforcing is back ("am:
+        // Permission denied"). ksud runs late-load.d scripts blocking, in its
+        // own u:r:ksu:s0 context, after the module is up and before it restarts
+        // the manager — which is exactly the window this needs.
+        //
+        // What the hook does, and why:
+        //  - set-apk crowns the manager synchronously. The driver only hands a
+        //    manager its fd, and only unblocks __NR_reboot in its seccomp cache
+        //    (without which the manager's own ksud dies of SIGSYS), when zygote
+        //    specialises into an appid the kernel already recognises. Left to
+        //    itself the kernel learns that from a /data/app scan module init
+        //    merely queues, which ksud's manager restart routinely beats.
+        //  - stopping the manager afterwards discards any process started
+        //    before the crowning, since an fd is only granted at specialisation.
+        val managerApk = runCatching {
+            app.packageManager.getPackageInfo(MANAGER_PACKAGE, 0).applicationInfo?.sourceDir
+        }.getOrNull()
+
+        val stageLog = File(app.filesDir, "ksu-stage.log")
+        stageLog.delete()
+        stageLog.createNewFile()
+
+        if (managerApk != null) {
+            val hook = File(app.filesDir, "rmp-crown.sh")
+            hook.writeText(buildString {
+                appendLine("#!/system/bin/sh")
+                appendLine("exec >> '${stageLog.absolutePath}' 2>&1")
+                appendLine("'$ksudDest' kernel dynamic-manager set-apk '$managerApk'")
+                appendLine("'${helper.absolutePath}' --ksu-manager")
+                appendLine("am force-stop $MANAGER_PACKAGE")
+                appendLine("echo $MARK_DONE")
+            })
+            hook.setReadable(true, false)
+            val installHook = runHelper(helper, "-c",
+                "mkdir -p $LATE_LOAD_DIR && cp '${hook.absolutePath}' $LATE_LOAD_DIR/rmp-crown.sh && " +
+                "chmod 755 $LATE_LOAD_DIR/rmp-crown.sh && chown root:root $LATE_LOAD_DIR/rmp-crown.sh")
+            if (installHook.code != 0) {
+                appendLog("[!] Could not install late-load hook: ${installHook.output.take(160)}")
+            }
+        }
+
         appendLog("[*] Triggering KernelSU late-load (kmi=${payloads.kmi})...")
         val lateResult = runHelper(helper, "-c",
-            "$ksudDest late-load --kmi ${payloads.kmi}")
+            "'$ksudDest' late-load --kmi ${payloads.kmi} --package-name $MANAGER_PACKAGE")
         if (lateResult.output.isNotBlank()) {
             appendLog(lateResult.output.take(2000))
         }
 
-        // 4. Verify KSU is actually loaded (check multiple paths)
-        var ksuActive = false
-        for (i in 1..10) {
-            val check = runHelper(helper, "-c",
-                "test -e /dev/kernelsu && echo KSU_OK || " +
-                "test -e /sys/kernel/kernelsu && echo KSU_OK || " +
-                "test -e /data/adb/ksu && echo KSU_OK || " +
-                "echo KSU_NOT_FOUND")
-            if (check.output.contains("KSU_OK")) {
-                appendLog("[+] KernelSU verified (attempt $i): ${check.output.take(60)}")
-                ksuActive = true
-                break
-            }
-            Thread.sleep(500)
+        // The hook appends here as root; this process only reads its own file.
+        var staged = ""
+        for (i in 1..HOOK_REPORT_ATTEMPTS) {
+            staged = runCatching { stageLog.readText() }.getOrDefault("")
+            if (staged.contains(MARK_DONE)) break
+            Thread.sleep(HOOK_REPORT_POLL_MILLIS)
         }
-        require(ksuActive) {
-            app.getString(
-                R.string.error_ksu_verify,
-                lateResult.code,
-                lateResult.output.take(200)
-            )
+        if (staged.isNotBlank()) {
+            appendLog(staged.take(4000))
+        }
+        if (!staged.contains(MARK_DONE)) {
+            appendLog("[!] late-load hook did not report back; " +
+                "check $LATE_LOAD_DIR/rmp-crown.sh output")
+        }
+
+        // Deliberately not failed on a missing marker. Once late-load returns
+        // there is nothing this process can still check: the daemon socket is
+        // gone with SELinux back to enforcing, /proc/modules reads empty from an
+        // app uid, and /data/adb is unreadable — so a missing marker means "no
+        // answer", not "no module", and failing here would condemn installs
+        // that worked. The warning above says so in the log.
+        require(lateResult.code == 0) {
+            app.getString(R.string.error_ksu_verify, lateResult.code,
+                lateResult.output.take(200))
         }
         appendLog(app.getString(R.string.log_ksu_control_verified))
     }
@@ -629,8 +687,14 @@ class InstallViewModel(application: Application) : AndroidViewModel(application)
     data class CommandResult(val code: Int, val output: String)
 
     companion object {
+        private const val HOOK_REPORT_ATTEMPTS = 60
+        private const val HOOK_REPORT_POLL_MILLIS = 500L
         private const val HELPER_LIB_NAME = "libcve43499root.so"
+        private const val MANAGER_PACKAGE = "com.resukisu.resukisu"
         private const val EXPLOIT_LOG_NAME = "exploit.log"
+        private const val INSTALL_LOG_NAME = "install.log"
+        private const val LATE_LOAD_DIR = "/data/adb/late-load.d"
+        private const val MARK_DONE = "RMP_KSU_DONE"
         private val KASLR_BASE_PATTERN = Regex("slide-kaslr-ok[^\\n]*\\bbase=([0-9a-f]{16})\\b")
         private const val EXPLOIT_STALL_MILLIS = 600_000L
         private const val EXPLOIT_TOTAL_MILLIS = 1_800_000L

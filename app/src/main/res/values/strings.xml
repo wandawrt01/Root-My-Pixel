@@ -67,6 +67,9 @@
     <string name="log_kaslr_reused">Reusing KASLR base %1$s — skipping slide</string>
     <string name="log_ksu_staged">ReSukiSU binary staged</string>
     <string name="log_ksu_control_verified">ReSukiSU control interface verified</string>
+    <string name="log_manager_known">Driver identified the manager (%1$s)</string>
+    <string name="log_manager_unknown">Driver has not identified the manager yet — it may need a second launch</string>
+    <string name="log_manager_restarted">ReSukiSU Manager stopped — open it for a fresh start</string>
     <string name="log_install_complete">Installation complete — ReSukiSU is active</string>
 
     <!-- Errors -->

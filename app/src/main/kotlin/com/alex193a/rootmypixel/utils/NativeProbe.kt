@@ -26,6 +26,7 @@ object NativeProbe {
             File("/data/adb/ksu/bin/ksu").exists()
     }
 
+
     /**
      * Read current device snapshot from /proc and system properties.
      */
